@@ -37,6 +37,21 @@ def rate_ok(ip: str) -> bool:
     return True
 
 
+def normalize_yt_url(url: str) -> str:
+    """Convert youtu.be / shorts / live / embed URLs to canonical watch URLs.
+    yt-dlp's PO-token path is flaky on short/redirect URL forms, so normalize
+    everything to https://www.youtube.com/watch?v=... first."""
+    p = urllib.parse.urlparse(url)
+    host = (p.hostname or "").lower()
+    if host in ("youtu.be", "www.youtu.be"):
+        vid = p.path.strip("/").split("/")[0]
+        return f"https://www.youtube.com/watch?v={vid}"
+    m = re.match(r"^/(shorts|live|embed)/([^/?#]+)", p.path or "")
+    if m and host.endswith("youtube.com"):
+        return f"https://www.youtube.com/watch?v={m.group(2)}"
+    return url
+
+
 def ytdlp_json(url: str) -> dict:
     cmd = [
         "yt-dlp",
@@ -110,7 +125,7 @@ async def resolve(req: Request):
         raise HTTPException(429, "rate limited, try again in a minute")
 
     try:
-        d = ytdlp_json(url)
+        d = ytdlp_json(normalize_yt_url(url))
     except Exception as e:
         # Include the underlying error detail so we can diagnose deployment issues
         return JSONResponse(
