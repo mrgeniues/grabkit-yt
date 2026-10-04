@@ -1,10 +1,15 @@
 """grabkit-yt: tiny YouTube resolver microservice.
 POST /resolve {"url": "<youtube watch/shorts url>"} -> video metadata + progressive download formats
 GET  /dl?u=<googlevideo stream url>&n=<filename>            -> proxied download (SSRF-guarded)
+GET  /merge?url=<youtube url>&q=720&n=<name>                 -> yt-dlp downloads best video<=q + audio, ffmpeg-merges to MP4
 """
 import json
+import os
 import re
+import shutil
 import subprocess
+import tempfile
+import threading
 import time
 import urllib.parse
 from collections import defaultdict
@@ -176,6 +181,20 @@ async def resolve(req: Request):
             "url": a["url"],
         }
 
+    # Video-only (DASH/SABR) options with direct URLs, deduped by height.
+    # These need server-side merging -> served via /merge.
+    dash = []
+    seen_h: set[int] = set()
+    all_fmts = d.get("formats", []) or []
+    for f in sorted(all_fmts, key=lambda x: (x.get("height") or 0), reverse=True):
+        if not f.get("url"):
+            continue
+        v, a_ = f.get("vcodec"), f.get("acodec")
+        h = f.get("height") or 0
+        if v and v != "none" and (not a_ or a_ == "none") and h and h not in seen_h:
+            seen_h.add(h)
+            dash.append({"height": h, "label": f"{h}p", "id": f["format_id"]})
+
     return {
         "status": "ok",
         "title": d.get("title"),
@@ -185,6 +204,11 @@ async def resolve(req: Request):
         "views": d.get("view_count"),
         "formats": formats,
         "audio": audio,
+        "dash": dash,
+        "stats": {
+            "total_formats": len(all_fmts),
+            "with_url": sum(1 for f in all_fmts if f.get("url")),
+        },
     }
 
 
@@ -219,3 +243,86 @@ def dl(u: str, n: str = "video.mp4"):
         media_type="video/mp4",
         headers={"Content-Disposition": f'attachment; filename="{safe}"'},
     )
+
+
+MERGE_LOCK = threading.Lock()
+
+
+@app.get("/merge")
+def merge(url: str, q: int = 720, n: str = "video.mp4"):
+    """Download best video (<=q p) + best audio via yt-dlp and ffmpeg-merge to
+    MP4. Used for qualities above 360p (DASH video-only + audio-only)."""
+    url = (url or "").strip()
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    if host not in YT_HOSTS:
+        raise HTTPException(400, "not a youtube url")
+    q = max(144, min(int(q or 720), 2160))
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", n)[:80] or "video.mp4"
+    if not safe.lower().endswith(".mp4"):
+        safe += ".mp4"
+
+    if not MERGE_LOCK.acquire(blocking=False):
+        raise HTTPException(429, "another merge in progress, try again in a bit")
+    tmpdir = tempfile.mkdtemp(prefix="gkyt-")
+    try:
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--extractor-args",
+            "youtube:player_client=web,web_embedded,android,ios,tv",
+            "--extractor-args",
+            "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
+            "-f",
+            f"bv[height<={q}]+ba/b[height<={q}]/b",
+            "--merge-output-format",
+            "mp4",
+            "-o",
+            os.path.join(tmpdir, "out.%(ext)s"),
+            normalize_yt_url(url),
+        ]
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            raise HTTPException(504, "merge timed out (video too long?)")
+        if p.returncode != 0:
+            raise HTTPException(502, f"merge failed: {(p.stderr or '')[-400:]}")
+        files = [
+            f
+            for f in os.listdir(tmpdir)
+            if os.path.isfile(os.path.join(tmpdir, f))
+            and not f.endswith((".part", ".ytdl", ".temp"))
+        ]
+        if not files:
+            raise HTTPException(502, "merge produced no file")
+        best = max(files, key=lambda f: os.path.getsize(os.path.join(tmpdir, f)))
+        fpath = os.path.join(tmpdir, best)
+        size = os.path.getsize(fpath)
+
+        def gen():
+            try:
+                with open(fpath, "rb") as fh:
+                    while True:
+                        chunk = fh.read(65536)
+                        if not chunk:
+                            break
+                        yield chunk
+            finally:
+                shutil.rmtree(tmpdir, ignore_errors=True)
+                MERGE_LOCK.release()
+
+        return StreamingResponse(
+            gen(),
+            media_type="video/mp4",
+            headers={
+                "Content-Disposition": f'attachment; filename="{safe}"',
+                "Content-Length": str(size),
+            },
+        )
+    except HTTPException:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        MERGE_LOCK.release()
+        raise
+    except Exception as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        MERGE_LOCK.release()
+        raise HTTPException(500, f"merge error: {e}")

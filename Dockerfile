@@ -1,8 +1,9 @@
 FROM python:3.12-slim
 
-# System deps: curl (deno installer), git + nodejs/npm (bgutil PO-token server)
+# System deps: curl (deno installer), git + nodejs/npm (bgutil PO-token server),
+# ffmpeg (merging DASH video+audio for 720p/1080p)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates unzip git nodejs npm \
+    curl ca-certificates unzip git nodejs npm ffmpeg \
  && rm -rf /var/lib/apt/lists/*
 
 # Deno (yt-dlp needs a JS runtime to solve YouTube's signature challenge)
@@ -15,8 +16,12 @@ ENV PATH="/root/.deno/bin:${PATH}" \
 RUN git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil \
  && cd /opt/bgutil/server && npm install --no-audit --no-fund && npx tsc
 
-# Python deps (includes the yt-dlp PO-token provider plugin)
-RUN pip install --no-cache-dir fastapi "uvicorn[standard]" "yt-dlp[default]" requests bgutil-ytdlp-pot-provider
+# Python deps (includes the yt-dlp PO-token provider plugin).
+# yt-dlp is installed from the SABR-protocol PR branch so SABR-only sessions
+# can still download full-quality streams; protobug is its dependency.
+RUN pip install --no-cache-dir fastapi "uvicorn[standard]" requests \
+    bgutil-ytdlp-pot-provider protobug \
+    "yt-dlp[default] @ git+https://github.com/yt-dlp/yt-dlp.git@6ef0ae00f0a4e9dd042193b3f5a2bb28b5fc0ca6"
 
 WORKDIR /app
 COPY app.py /app/app.py
