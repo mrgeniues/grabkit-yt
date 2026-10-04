@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 # System deps: curl (deno installer), git + nodejs/npm (bgutil PO-token server)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl ca-certificates git nodejs npm \
+    curl ca-certificates unzip git nodejs npm \
  && rm -rf /var/lib/apt/lists/*
 
 # Deno (yt-dlp needs a JS runtime to solve YouTube's signature challenge)
