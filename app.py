@@ -57,40 +57,33 @@ def normalize_yt_url(url: str) -> str:
     return url
 
 
-def _pot_diagnostics(stderr: str) -> str:
-    """Pull PO-token / SABR relevant lines out of yt-dlp verbose output so we
-    can tell whether the token sidecar is being used."""
-    hits = []
-    for line in (stderr or "").split("\n"):
-        low = line.lower()
-        if any(
-            k in low
-            for k in (
-                "po token",
-                "pot ",
-                "youtubepot",
-                "bgutil",
-                "sabr",
-                "attestation",
-                "visitor data",
-            )
-        ):
-            hits.append(line.strip()[-220:])
-    return "\n".join(hits[-12:])
+YTDLP_LOCK = threading.Lock()
 
 
-def run_yt_dlp(cmd: list[str], timeout: int, retries: int = 3) -> subprocess.CompletedProcess:
+def run_yt_dlp(cmd: list[str], timeout: int, retries: int = 2, blocking: bool = True) -> subprocess.CompletedProcess:
     """Run yt-dlp with retries and backoff. YouTube 403s are often transient
-    (datacenter IP lottery) and clear on a retry a few seconds later."""
-    last: subprocess.CompletedProcess | None = None
-    for attempt in range(retries):
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if p.returncode == 0:
-            return p
-        last = p
-        time.sleep(5 * (attempt + 1))
-    assert last is not None
-    return last
+    (datacenter IP lottery) and clear on a retry a few seconds later.
+
+    All yt-dlp invocations are serialized through a global lock: concurrent
+    runs (each triggering PO-token BotGuard solves in the node sidecar) can
+    exceed the 512MB free-tier RAM and get the container OOM-killed.
+    """
+    if blocking:
+        YTDLP_LOCK.acquire()
+    elif not YTDLP_LOCK.acquire(blocking=False):
+        raise RuntimeError("server busy, try again in a bit")
+    try:
+        last: subprocess.CompletedProcess | None = None
+        for attempt in range(retries):
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            if p.returncode == 0:
+                return p
+            last = p
+            time.sleep(5 * (attempt + 1))
+        assert last is not None
+        return last
+    finally:
+        YTDLP_LOCK.release()
 
 
 def ytdlp_json(url: str) -> dict:
@@ -98,7 +91,6 @@ def ytdlp_json(url: str) -> dict:
         "yt-dlp",
         "--no-playlist",
         "--skip-download",
-        "--verbose",
         # Try several YouTube player clients; with a valid PO token (from the
         # local bgutil server) these pass YouTube's bot checks on datacenter IPs.
         "--extractor-args",
@@ -109,11 +101,10 @@ def ytdlp_json(url: str) -> dict:
         "-J",
         url,
     ]
-    p = run_yt_dlp(cmd, timeout=120, retries=3)
+    p = run_yt_dlp(cmd, timeout=120, retries=2, blocking=False)
     if p.returncode != 0:
-        diag = _pot_diagnostics(p.stderr)
         tail = (p.stderr or "")[-500:]
-        raise RuntimeError(f"{tail}\n---POT-DIAG---\n{diag}" if diag else tail or "yt-dlp failed")
+        raise RuntimeError(tail or "yt-dlp failed")
     return json.loads(p.stdout)
 
 
@@ -170,6 +161,12 @@ async def resolve(req: Request):
 
     try:
         d = ytdlp_json(normalize_yt_url(url))
+    except RuntimeError as e:
+        if "server busy" in str(e):
+            raise HTTPException(429, "server busy, try again in a bit")
+        return JSONResponse(
+            {"status": "error", "code": "fetch_failed", "detail": str(e)[-800:]}
+        )
     except Exception as e:
         # Include the underlying error detail so we can diagnose deployment issues
         return JSONResponse(
@@ -284,9 +281,6 @@ def dl(u: str, n: str = "video.mp4"):
     )
 
 
-MERGE_LOCK = threading.Lock()
-
-
 @app.get("/merge")
 def merge(url: str, q: int = 720, n: str = "video.mp4"):
     """Download best video (<=q p) + best audio via yt-dlp and ffmpeg-merge to
@@ -300,8 +294,6 @@ def merge(url: str, q: int = 720, n: str = "video.mp4"):
     if not safe.lower().endswith(".mp4"):
         safe += ".mp4"
 
-    if not MERGE_LOCK.acquire(blocking=False):
-        raise HTTPException(429, "another merge in progress, try again in a bit")
     tmpdir = tempfile.mkdtemp(prefix="gkyt-")
     try:
         cmd = [
@@ -320,9 +312,13 @@ def merge(url: str, q: int = 720, n: str = "video.mp4"):
             normalize_yt_url(url),
         ]
         try:
-            p = run_yt_dlp(cmd, timeout=600, retries=2)
+            p = run_yt_dlp(cmd, timeout=600, retries=2, blocking=True)
         except subprocess.TimeoutExpired:
             raise HTTPException(504, "merge timed out (video too long?)")
+        except RuntimeError as e:
+            if "server busy" in str(e):
+                raise HTTPException(429, "server busy, try again in a bit")
+            raise
         if p.returncode != 0:
             raise HTTPException(502, f"merge failed: {(p.stderr or '')[-400:]}")
         files = [
@@ -347,7 +343,6 @@ def merge(url: str, q: int = 720, n: str = "video.mp4"):
                         yield chunk
             finally:
                 shutil.rmtree(tmpdir, ignore_errors=True)
-                MERGE_LOCK.release()
 
         return StreamingResponse(
             gen(),
@@ -359,9 +354,7 @@ def merge(url: str, q: int = 720, n: str = "video.mp4"):
         )
     except HTTPException:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        MERGE_LOCK.release()
         raise
     except Exception as e:
         shutil.rmtree(tmpdir, ignore_errors=True)
-        MERGE_LOCK.release()
         raise HTTPException(500, f"merge error: {e}")

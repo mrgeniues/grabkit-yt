@@ -27,5 +27,6 @@ WORKDIR /app
 COPY app.py /app/app.py
 
 EXPOSE 10000
-# Start the PO-token server in the background, then the API
-CMD ["sh", "-c", "node /opt/bgutil/server/build/main.js --port 4416 & exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]
+# Start the PO-token server in the background (heap capped at 256MB so BotGuard
+# challenge solving can't OOM the 512MB free-tier instance), then the API
+CMD ["sh", "-c", "node --max-old-space-size=256 /opt/bgutil/server/build/main.js --port 4416 & exec uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000}"]
