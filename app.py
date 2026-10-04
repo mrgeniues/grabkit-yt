@@ -57,11 +57,48 @@ def normalize_yt_url(url: str) -> str:
     return url
 
 
+def _pot_diagnostics(stderr: str) -> str:
+    """Pull PO-token / SABR relevant lines out of yt-dlp verbose output so we
+    can tell whether the token sidecar is being used."""
+    hits = []
+    for line in (stderr or "").split("\n"):
+        low = line.lower()
+        if any(
+            k in low
+            for k in (
+                "po token",
+                "pot ",
+                "youtubepot",
+                "bgutil",
+                "sabr",
+                "attestation",
+                "visitor data",
+            )
+        ):
+            hits.append(line.strip()[-220:])
+    return "\n".join(hits[-12:])
+
+
+def run_yt_dlp(cmd: list[str], timeout: int, retries: int = 3) -> subprocess.CompletedProcess:
+    """Run yt-dlp with retries and backoff. YouTube 403s are often transient
+    (datacenter IP lottery) and clear on a retry a few seconds later."""
+    last: subprocess.CompletedProcess | None = None
+    for attempt in range(retries):
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if p.returncode == 0:
+            return p
+        last = p
+        time.sleep(5 * (attempt + 1))
+    assert last is not None
+    return last
+
+
 def ytdlp_json(url: str) -> dict:
     cmd = [
         "yt-dlp",
         "--no-playlist",
         "--skip-download",
+        "--verbose",
         # Try several YouTube player clients; with a valid PO token (from the
         # local bgutil server) these pass YouTube's bot checks on datacenter IPs.
         "--extractor-args",
@@ -72,9 +109,11 @@ def ytdlp_json(url: str) -> dict:
         "-J",
         url,
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
+    p = run_yt_dlp(cmd, timeout=120, retries=3)
     if p.returncode != 0:
-        raise RuntimeError(p.stderr[-800:] if p.stderr else "yt-dlp failed")
+        diag = _pot_diagnostics(p.stderr)
+        tail = (p.stderr or "")[-500:]
+        raise RuntimeError(f"{tail}\n---POT-DIAG---\n{diag}" if diag else tail or "yt-dlp failed")
     return json.loads(p.stdout)
 
 
@@ -281,7 +320,7 @@ def merge(url: str, q: int = 720, n: str = "video.mp4"):
             normalize_yt_url(url),
         ]
         try:
-            p = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+            p = run_yt_dlp(cmd, timeout=600, retries=2)
         except subprocess.TimeoutExpired:
             raise HTTPException(504, "merge timed out (video too long?)")
         if p.returncode != 0:
