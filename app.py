@@ -42,14 +42,19 @@ def ytdlp_json(url: str) -> dict:
         "yt-dlp",
         "--no-playlist",
         "--skip-download",
+        # Try several YouTube player clients; with a valid PO token (from the
+        # local bgutil server) these pass YouTube's bot checks on datacenter IPs.
         "--extractor-args",
-        "youtube:player_client=web_embedded",
+        "youtube:player_client=web,web_embedded,android,ios,tv",
+        # PO-token provider served by the local bgutil sidecar (port 4416)
+        "--extractor-args",
+        "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
         "-J",
         url,
     ]
-    p = subprocess.run(cmd, capture_output=True, text=True, timeout=150)
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=240)
     if p.returncode != 0:
-        raise RuntimeError(p.stderr[-500:] if p.stderr else "yt-dlp failed")
+        raise RuntimeError(p.stderr[-800:] if p.stderr else "yt-dlp failed")
     return json.loads(p.stdout)
 
 
@@ -79,6 +84,15 @@ def debug():
         info["ytdlp_version"] = (p.stdout or "").strip()
     except Exception as e:
         info["ytdlp_version"] = f"FAILED: {e}"
+    # Is the bgutil PO-token sidecar listening on 127.0.0.1:4416?
+    import socket
+
+    try:
+        s = socket.create_connection(("127.0.0.1", 4416), timeout=5)
+        s.close()
+        info["pot_server"] = "listening"
+    except Exception as e:
+        info["pot_server"] = f"NOT LISTENING: {e}"
     return info
 
 
