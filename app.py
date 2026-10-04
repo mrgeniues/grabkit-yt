@@ -58,6 +58,30 @@ def health():
     return {"ok": True, "service": "grabkit-yt"}
 
 
+@app.get("/debug")
+def debug():
+    """Diagnose the container: is deno on PATH? does yt-dlp see a JS runtime?"""
+    import shutil
+
+    info: dict = {}
+    info["deno_path"] = shutil.which("deno")
+    try:
+        p = subprocess.run(
+            ["deno", "--version"], capture_output=True, text=True, timeout=15
+        )
+        info["deno_version"] = (p.stdout or p.stderr or "").strip().split("\n")[0]
+    except Exception as e:
+        info["deno_version"] = f"FAILED: {e}"
+    try:
+        p = subprocess.run(
+            ["yt-dlp", "--version"], capture_output=True, text=True, timeout=15
+        )
+        info["ytdlp_version"] = (p.stdout or "").strip()
+    except Exception as e:
+        info["ytdlp_version"] = f"FAILED: {e}"
+    return info
+
+
 @app.post("/resolve")
 async def resolve(req: Request):
     try:
@@ -73,8 +97,11 @@ async def resolve(req: Request):
 
     try:
         d = ytdlp_json(url)
-    except Exception:
-        return JSONResponse({"status": "error", "code": "fetch_failed"})
+    except Exception as e:
+        # Include the underlying error detail so we can diagnose deployment issues
+        return JSONResponse(
+            {"status": "error", "code": "fetch_failed", "detail": str(e)[-800:]}
+        )
 
     # Progressive formats only (video+audio in one file -> no ffmpeg needed)
     progressive = []
